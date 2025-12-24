@@ -1,6 +1,18 @@
+# Model files and checkpoints - EXCLUDE THESE
 *.bin
+*.pt
+*.pth
+*.safetensors
+pytorch_model.bin
+model.safetensors
+checkpoint-*/
+**/checkpoint-*/
 models/
-data/
+
+# Data directory - but ALLOW .jsonl files (see bottom of file)
+# Uncomment specific data subdirectories to ignore if needed:
+# data/raw/
+# data/processed/
 
 nav
 tags
@@ -165,3 +177,38 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# =============================================================================
+# PROJECT-SPECIFIC IGNORES
+# =============================================================================
+
+# Weights & Biases
+wandb/
+
+# TensorBoard logs
+**/tensorboard/
+events.out.tfevents.*
+
+# Claude Code workspace
+.claude/
+
+# Training outputs - ignore checkpoints but keep logs and metrics
+overnight_results_*/
+hparam_sweep_results/
+!**/*.jsonl
+!**/metrics*.jsonl
+!**/experiment.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# =============================================================================
+# IMPORTANT: JSONL FILES ARE COMMITTED
+# =============================================================================
+# The following file types are NOT ignored and will be committed:
+# - *.jsonl (training data, metrics, evaluation results)
+# - This includes files in data/, math_rlvr/, and all subdirectories
+#
+# To explicitly allow .jsonl files even in ignored directories, they're
+# negated with ! patterns above.
