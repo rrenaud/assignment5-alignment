@@ -1,0 +1,2 @@
+python3 /workspace/assignment5-alignment/math_rlvr/eval_math.py --prompt-style chat --jsonl-output /workspace/assignment5-alignment/math_rlvr/choosen_sft_chat_eval.jsonl --model /workspace/assignment5-alignment/choosen_sft/final_model
+Sun Dec 28 20:23:25 UTC 2025: Modified math_rlvr/eval_math.py to add --eval-only mode for re-evaluating existing JSONL files

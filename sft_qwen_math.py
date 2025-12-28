@@ -284,20 +284,8 @@ def sft_microbatch_train_step(
     # Negative log likelihood loss (only on response tokens)
     nll_loss = -policy_log_probs
 
-    # Compute loss per batch element (average over sequence)
-    # Then average over batch
-    batch_size = policy_log_probs.size(0)
-
-    # Sum over masked elements and normalize
-    total_loss = masked_normalize(
-        nll_loss,
-        response_mask,
-        dim=None,
-        normalize_constant=normalize_constant,
-    )
-
-    # Average over batch
-    loss = total_loss / batch_size
+    # Compute per-token average loss (stable across varying response lengths)
+    loss = masked_mean(nll_loss, response_mask, dim=None)
 
     # Scale by gradient accumulation before backward
     scaled_loss = loss / gradient_accumulation_steps
@@ -546,6 +534,78 @@ def collate_fn(batch, tokenizer, max_length=2048):
 
 
 # ============================================================================
+# Validation Function
+# ============================================================================
+
+@torch.no_grad()
+def validate(
+    model: PreTrainedModel,
+    val_loader: DataLoader,
+    device: torch.device,
+    autocast_dtype: torch.dtype,
+) -> Dict[str, float]:
+    """Compute validation loss over the entire validation set.
+
+    Args:
+        model: The model to validate
+        val_loader: DataLoader for validation data
+        device: Device to run on
+        autocast_dtype: Dtype for mixed precision
+
+    Returns:
+        Dictionary with validation metrics
+    """
+    model.eval()
+
+    total_loss = 0.0
+    total_tokens = 0
+    total_correct = 0
+
+    for batch in val_loader:
+        input_ids = batch["input_ids"].to(device)
+        labels = batch["labels"].to(device)
+        response_mask = batch["response_mask"].to(device)
+
+        with torch.amp.autocast('cuda', dtype=autocast_dtype):
+            outputs = model(input_ids=input_ids)
+            logits = outputs.logits
+
+            # Get log probabilities
+            log_probs = torch.log_softmax(logits, dim=-1)
+            token_log_probs = torch.gather(
+                log_probs,
+                dim=-1,
+                index=labels.unsqueeze(-1)
+            ).squeeze(-1)
+
+            # NLL loss per token
+            nll_per_token = -token_log_probs
+
+            # Accumulate masked losses
+            masked_nll = nll_per_token * response_mask
+            total_loss += masked_nll.sum().item()
+            total_tokens += response_mask.sum().item()
+
+            # Token accuracy
+            predicted_tokens = logits.argmax(dim=-1)
+            correct = ((predicted_tokens == labels).float() * response_mask).sum().item()
+            total_correct += correct
+
+    model.train()
+
+    avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
+    accuracy = total_correct / total_tokens if total_tokens > 0 else 0.0
+    perplexity = torch.exp(torch.tensor(avg_loss)).item()
+
+    return {
+        "loss/val": avg_loss,
+        "loss/val_perplexity": perplexity,
+        "accuracy/val_token": accuracy,
+        "stats/val_tokens": total_tokens,
+    }
+
+
+# ============================================================================
 # Training Function
 # ============================================================================
 
@@ -554,6 +614,7 @@ def train(
     tokenizer: PreTrainedTokenizerBase,
     train_dataset: Dataset,
     args: argparse.Namespace,
+    val_dataset: Optional[Dataset] = None,
 ):
     """Main training loop."""
     
@@ -569,11 +630,24 @@ def train(
         num_workers=args.num_workers,
         collate_fn=lambda batch: collate_fn(batch, tokenizer, args.max_length),
     )
+
+    # Validation data loader (if provided)
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=lambda batch: collate_fn(batch, tokenizer, args.max_length),
+        )
     
     # Calculate total steps
     if args.max_steps:
         total_steps = args.max_steps
-        num_epochs = (total_steps // len(train_loader)) + 1
+        # Each step requires gradient_accumulation_steps batches
+        steps_per_epoch = len(train_loader) // args.gradient_accumulation_steps
+        num_epochs = (total_steps // steps_per_epoch) + 1
     else:
         num_epochs = args.num_epochs
         total_steps = len(train_loader) * num_epochs
@@ -628,6 +702,7 @@ def train(
     print("=" * 60)
     print(f"  Model: {args.model_name}")
     print(f"  Training examples: {len(train_dataset)}")
+    print(f"  Validation examples: {len(val_dataset) if val_dataset else 'None'}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
     print(f"  Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
@@ -635,6 +710,7 @@ def train(
     print(f"  Max sequence length: {args.max_length}")
     print(f"  Total steps: {total_steps}")
     print(f"  Warmup steps: {warmup_steps}")
+    print(f"  Eval steps: {args.eval_steps if val_dataset else 'N/A'}")
     print(f"  Precision: {'bfloat16' if args.bf16 else 'float16' if args.fp16 else 'float32'}")
     print("=" * 60 + "\n")
     
@@ -668,7 +744,6 @@ def train(
                     policy_log_probs=token_log_probs,
                     response_mask=response_mask,
                     gradient_accumulation_steps=args.gradient_accumulation_steps,
-                    normalize_constant=1.0,
                 )
             
             # Backward pass
@@ -773,7 +848,15 @@ def train(
                     pbar.set_postfix(postfix_dict)
                 
                 pbar.update(1)
-                
+
+                # Validation
+                if val_loader is not None and global_step % args.eval_steps == 0:
+                    val_metrics = validate(model, val_loader, device, autocast_dtype)
+                    metrics_logger.log_metrics(val_metrics, global_step)
+                    print(f"\n[Step {global_step}] Val loss: {val_metrics['loss/val']:.4f}, "
+                          f"Val perplexity: {val_metrics['loss/val_perplexity']:.2f}, "
+                          f"Val accuracy: {val_metrics['accuracy/val_token']:.4f}")
+
                 # Save checkpoint
                 if global_step % args.save_steps == 0:
                     checkpoint_dir = Path(args.output_dir) / f"checkpoint-epoch{epoch}-step{global_step}"
@@ -818,6 +901,8 @@ def main():
     # Data arguments
     parser.add_argument("--train-data", type=str, required=True,
                        help="Path to training JSONL file")
+    parser.add_argument("--val-data", type=str, default=None,
+                       help="Path to validation JSONL file (optional)")
     parser.add_argument("--filter-correct", action="store_true",
                        help="Only use correct responses")
     parser.add_argument("--include-ground-truth", action="store_true",
@@ -852,6 +937,8 @@ def main():
                        help="Save checkpoint every N steps")
     parser.add_argument("--logging-steps", type=int, default=10,
                        help="Log metrics every N steps")
+    parser.add_argument("--eval-steps", type=int, default=500,
+                       help="Run validation every N steps")
     parser.add_argument("--resume-from", type=str, default=None,
                        help="Resume training from checkpoint")
     
@@ -887,16 +974,40 @@ def main():
         model.config.pad_token_id = tokenizer.eos_token_id
     
     # Load dataset
-    train_dataset = MathSFTDataset(
+    full_dataset = MathSFTDataset(
         data_path=args.train_data,
         tokenizer=tokenizer,
         max_length=args.max_length,
         filter_correct=args.filter_correct,
         include_ground_truth=args.include_ground_truth,
     )
-    
+
+    # Load or split validation dataset
+    if args.val_data:
+        # Use provided validation file
+        train_dataset = full_dataset
+        val_dataset = MathSFTDataset(
+            data_path=args.val_data,
+            tokenizer=tokenizer,
+            max_length=args.max_length,
+            filter_correct=False,
+            include_ground_truth=False,
+        )
+    else:
+        # Split last 10% of training data for validation
+        total_size = len(full_dataset)
+        val_size = max(1, int(total_size * 0.1))
+        train_size = total_size - val_size
+
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            full_dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42),  # Reproducible split
+        )
+        print(f"Split dataset: {train_size} train, {val_size} validation (10%)")
+
     # Train
-    train(model, tokenizer, train_dataset, args)
+    train(model, tokenizer, train_dataset, args, val_dataset=val_dataset)
     
     print("\n" + "=" * 60)
     print("Training complete!")

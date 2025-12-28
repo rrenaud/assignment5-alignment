@@ -148,3 +148,9 @@ Some loss functions support optional `normalize_constant` parameters:
 3. **Tensor shapes**: Pay attention to batch dimensions - some operations expect (batch, seq_len), others expect scalar rewards of shape (batch, 1)
 4. **Loss scaling**: Don't forget to divide by `gradient_accumulation_steps` before `.backward()`
 5. **Mask handling**: Always check whether a mask is boolean or float (0/1), and whether masked elements should be zeroed or ignored
+
+
+## Maintain claude_log.txt
+
+Any time you run user written scripts/commands, add the command to claude_log.txt .  
+

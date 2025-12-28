@@ -1,0 +1,24 @@
+Loading results from /workspace/assignment5-alignment/math_rlvr/chat-fmt-r1.jsonl...
+Loaded 5000 records
+Re-evaluating 5000 records...
+
+============================================================
+EVAL-ONLY MODE (prompt style: chat)
+OVERALL ACCURACY: 2039/5000 (40.78%)
+============================================================
+
+Accuracy by Subject:
+  Algebra: 651/1187 (54.84%)
+  Counting & Probability: 207/474 (43.67%)
+  Geometry: 147/479 (30.69%)
+  Intermediate Algebra: 209/903 (23.15%)
+  Number Theory: 201/540 (37.22%)
+  Prealgebra: 504/871 (57.86%)
+  Precalculus: 120/546 (21.98%)
+
+Accuracy by Level:
+  Level 1: 307/437 (70.25%)
+  Level 2: 487/894 (54.47%)
+  Level 3: 513/1131 (45.36%)
+  Level 4: 457/1214 (37.64%)
+  Level 5: 275/1324 (20.77%)
