@@ -16,11 +16,12 @@ from math_verify import parse, verify
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-MODEL_NAME = "Qwen/Qwen2.5-Math-1.5B"
+DEFAULT_MODEL = "Qwen/Qwen2.5-Math-1.5B"
 VLLM_URL = "http://localhost:8000/v1/completions"
 
-# Load tokenizer
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# Global tokenizer and model name (initialized in main)
+tokenizer = None
+model_name = DEFAULT_MODEL
 
 # R1 Zero prompt template
 R1_ZERO_TEMPLATE = """A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.
@@ -111,7 +112,7 @@ def query_model(problem: str, max_tokens: int = 1024, temperature: float = 0.0,
     formatted_prompt, stop_sequences = format_prompt(problem, prompt_style)
 
     payload = {
-        "model": MODEL_NAME,
+        "model": model_name,
         "prompt": formatted_prompt,
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -182,8 +183,135 @@ def evaluate_problem(item: dict, debug: bool = False) -> dict:
     }
 
 
-def main():
+def load_jsonl_results(jsonl_path: str) -> list[dict]:
+    """Load all results from a JSONL file."""
+    results = []
+    with open(jsonl_path, "r", encoding="utf-8") as infile:
+        for line in infile:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                results.append(record)
+            except json.JSONDecodeError:
+                continue
+    return results
+
+
+def run_eval_only_mode(args):
+    """Re-evaluate existing JSONL results without querying vLLM."""
     global _prompt_style
+
+    jsonl_input = args.jsonl_input or args.jsonl_output
+    if not jsonl_input or not os.path.exists(jsonl_input):
+        print(f"Error: Input JSONL file not found: {jsonl_input}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Loading results from {jsonl_input}...")
+    records = load_jsonl_results(jsonl_input)
+    print(f"Loaded {len(records)} records")
+
+    if not records:
+        print("No records found in input file.")
+        return
+
+    # Filter by subjects if specified
+    if args.subjects:
+        subjects_lower = [s.lower() for s in args.subjects]
+        records = [r for r in records if r.get("subject", "").lower() in subjects_lower]
+        print(f"Filtered to subjects: {args.subjects} ({len(records)} records)")
+
+    # Filter by levels if specified
+    if args.levels:
+        records = [r for r in records if r.get("level") in args.levels]
+        print(f"Filtered to levels: {args.levels} ({len(records)} records)")
+
+    # Limit samples
+    if args.num_samples:
+        records = records[:args.num_samples]
+
+    print(f"Re-evaluating {len(records)} records...")
+
+    results = []
+    correct_by_subject = defaultdict(lambda: {"correct": 0, "total": 0})
+    correct_by_level = defaultdict(lambda: {"correct": 0, "total": 0})
+
+    # Open output file if different from input
+    jsonl_output = args.jsonl_output if args.jsonl_output != jsonl_input else None
+    jsonl_file = None
+    if jsonl_output:
+        jsonl_file = open(jsonl_output, "w", encoding="utf-8")
+
+    for record in tqdm(records, desc="Re-evaluating"):
+        response = record.get("response", "")
+        # We need the ground truth solution - try to get it from the record
+        # If not present, we'll use the stored ground_truth field
+        ground_truth_solution = record.get("solution", record.get("ground_truth", ""))
+
+        # Re-verify the answer
+        if response and not response.startswith("Query Error"):
+            correct, predicted, ground_truth = verify_answer(response, ground_truth_solution, _prompt_style)
+        else:
+            correct = False
+            predicted = record.get("predicted")
+            ground_truth = record.get("ground_truth")
+
+        result = {
+            "problem": record.get("problem"),
+            "ground_truth": ground_truth,
+            "predicted": predicted,
+            "correct": correct,
+            "level": record.get("level"),
+            "subject": record.get("subject"),
+            "response": response,
+        }
+        results.append(result)
+
+        if jsonl_file:
+            jsonl_file.write(json.dumps(result) + "\n")
+
+        # Update stats
+        subject = result.get("subject", "unknown")
+        level = result.get("level", "unknown")
+        correct_by_subject[subject]["total"] += 1
+        correct_by_level[level]["total"] += 1
+        if result["correct"]:
+            correct_by_subject[subject]["correct"] += 1
+            correct_by_level[level]["correct"] += 1
+
+    if jsonl_file:
+        jsonl_file.close()
+
+    # Calculate overall accuracy
+    total_correct = sum(1 for r in results if r["correct"])
+    total = len(results)
+    accuracy = total_correct / total * 100 if total > 0 else 0
+
+    # Print results
+    print("\n" + "=" * 60)
+    print(f"EVAL-ONLY MODE (prompt style: {args.prompt_style})")
+    print(f"OVERALL ACCURACY: {total_correct}/{total} ({accuracy:.2f}%)")
+    print("=" * 60)
+
+    print("\nAccuracy by Subject:")
+    for subject in sorted(correct_by_subject.keys()):
+        stats = correct_by_subject[subject]
+        acc = stats["correct"] / stats["total"] * 100 if stats["total"] > 0 else 0
+        print(f"  {subject}: {stats['correct']}/{stats['total']} ({acc:.2f}%)")
+
+    print("\nAccuracy by Level:")
+    for level in sorted(correct_by_level.keys()):
+        stats = correct_by_level[level]
+        acc = stats["correct"] / stats["total"] * 100 if stats["total"] > 0 else 0
+        print(f"  {level}: {stats['correct']}/{stats['total']} ({acc:.2f}%)")
+
+    if jsonl_output:
+        print(f"\nRe-evaluated results written to {jsonl_output}")
+
+
+def main():
+    global _prompt_style, tokenizer, model_name
 
     parser = argparse.ArgumentParser(description="Evaluate model on MATH dataset")
     parser.add_argument("--split", default="test", help="Dataset split (test, train)")
@@ -198,9 +326,32 @@ def main():
                         help="Prompt style: 'chat' (default) or 'r1_zero' (reasoning format)")
     parser.add_argument("--jsonl-output", type=str, default=None,
                         help="Write per-problem results incrementally to this JSONL file")
+    parser.add_argument("--jsonl-input", type=str, default=None,
+                        help="Input JSONL file for --eval-only mode (defaults to --jsonl-output)")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="Re-evaluate existing JSONL results without querying vLLM")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
+                        help="Model name/path for vLLM API requests")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        help="Tokenizer to use for prompt formatting (default: same as --model)")
 
     args = parser.parse_args()
     _prompt_style = args.prompt_style
+    model_name = args.model
+
+    # Handle eval-only mode (no vLLM needed)
+    if args.eval_only:
+        run_eval_only_mode(args)
+        return
+
+    # For normal mode, --jsonl-output is required
+    if not args.jsonl_output:
+        print("Error: --jsonl-output is required for normal evaluation mode", file=sys.stderr)
+        sys.exit(1)
+
+    # Load tokenizer (default to model name if not specified)
+    tokenizer_path = args.tokenizer if args.tokenizer else args.model
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
     # Check server is running
     try:

@@ -468,8 +468,16 @@ class MathSFTDataset(Dataset):
         # Load data
         self.examples = []
         with open(data_path, "r") as f:
-            for line in f:
-                item = json.loads(line)
+            for line_num, line in enumerate(f, 1):
+                # Remove null bytes and strip whitespace
+                line = line.replace('\x00', '').strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError as e:
+                    print(f"Warning: Skipping malformed line {line_num}: {e}")
+                    continue  # Skip malformed lines instead of failing
                 
                 # Filter if requested
                 if filter_correct and not item.get("correct", True):
@@ -654,9 +662,8 @@ def train(
                     dim=-1,
                     index=labels.unsqueeze(-1)
                 ).squeeze(-1)
-                
+
                 # Compute loss using our SFT function
-                token_log_probs.requires_grad = True
                 loss, _ = sft_microbatch_train_step(
                     policy_log_probs=token_log_probs,
                     response_mask=response_mask,
@@ -755,17 +762,15 @@ def train(
                     metrics_logger.log_metrics(metrics, global_step)
                     
                     # Update progress bar
-                    pbar.set_postfix({
+                    postfix_dict = {
                         "loss": f"{metrics['loss/train']:.4f}",
                         "lr": f"{metrics['learning_rate']:.2e}",
                         "grad": f"{metrics['gradient_norm']:.2f}",
                         "epoch": epoch + 1,
-                    })
+                    }
                     if "loss/boxed_tokens" in metrics:
-                        pbar.set_postfix({
-                            **pbar.postfix,
-                            "boxed": f"{metrics['loss/boxed_tokens']:.3f}",
-                        })
+                        postfix_dict["boxed"] = f"{metrics['loss/boxed_tokens']:.3f}"
+                    pbar.set_postfix(postfix_dict)
                 
                 pbar.update(1)
                 
